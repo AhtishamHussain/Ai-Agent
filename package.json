@@ -1,0 +1,27 @@
+{
+  "name": "digitalsofts-ai-employee",
+  "version": "1.0.0",
+  "private": true,
+  "description": "DigitalSofts AI Employee — multi-agent team that plans, builds, and ships production-ready software.",
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "lint": "next lint"
+  },
+  "dependencies": {
+    "jszip": "^3.10.1",
+    "next": "^15.1.0",
+    "openai": "^4.77.0",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "eslint": "^9.16.0",
+    "eslint-config-next": "^15.1.0",
+    "typescript": "^5.7.0"
+  }
+}
