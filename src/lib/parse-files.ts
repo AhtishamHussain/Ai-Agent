@@ -1,10 +1,18 @@
 import type { ProjectFile } from "./types";
 
+/** Strip DeepSeek-R1 / thinking model chains before parsing. */
+export function stripThinking(raw: string): string {
+  return raw
+    .replace(/<think>[\s\S]*?<\/think>/gi, "")
+    .replace(/<thinking>[\s\S]*?<\/thinking>/gi, "")
+    .trim();
+}
+
 /**
  * Extract a files array from model output (raw JSON or fenced JSON).
  */
 export function parseFilesFromResponse(raw: string): ProjectFile[] {
-  const trimmed = raw.trim();
+  const trimmed = stripThinking(raw);
   const candidates: string[] = [trimmed];
 
   const fence = trimmed.match(/```(?:json)?\s*([\s\S]*?)```/i);

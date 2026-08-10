@@ -222,7 +222,7 @@ export default function HomePage() {
 
       <footer className="foot">
         <span>DigitalSofts AI Employee</span>
-        <span>Free Gemini · Deploy on Vercel</span>
+        <span>Fast Groq 70B · auto key-rotate · local Ollama fallback</span>
       </footer>
     </div>
   );

@@ -2,7 +2,7 @@ import { hasApiKey, missingKeyHelp } from "@/lib/openai";
 import { runPipeline } from "@/lib/orchestrator";
 import type { SseEvent } from "@/lib/types";
 
-export const maxDuration = 300;
+export const maxDuration = 800;
 export const runtime = "nodejs";
 
 function encodeSse(event: SseEvent): string {

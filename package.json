@@ -4,9 +4,9 @@
   "private": true,
   "description": "DigitalSofts AI Employee — multi-agent team that plans, builds, and ships production-ready software.",
   "scripts": {
-    "dev": "next dev",
+    "dev": "node scripts/with-tls.js next dev",
     "build": "next build",
-    "start": "next start",
+    "start": "node scripts/with-tls.js next start",
     "lint": "next lint"
   },
   "dependencies": {

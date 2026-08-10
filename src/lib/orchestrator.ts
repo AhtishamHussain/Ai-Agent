@@ -1,6 +1,13 @@
 import type { AgentId, AgentMessage, ProjectFile, SseEvent } from "./types";
 import { getAgent } from "./types";
-import { getOpenAI, getProviderConfig } from "./openai";
+import {
+  describeActiveKey,
+  getOpenAI,
+  getProviderConfig,
+  isQuotaOrAuthError,
+  rotateProviderKey,
+  type ResolvedProvider,
+} from "./openai";
 import { systemPromptFor, userPromptFor } from "./agents/prompts";
 import { mergeFiles, needsFix, parseFilesFromResponse } from "./parse-files";
 
@@ -38,8 +45,8 @@ function filesSummary(files: ProjectFile[], maxPerFile = 1800): string {
     .join("\n\n");
 }
 
-/** Free-tier: only these agents call the API (avoids 429 mid-run). */
-const API_AGENTS = new Set<AgentId>([
+/** Free-tier cloud: fewer API calls. Local Ollama runs the full team. */
+const CLOUD_LITE_AGENTS = new Set<AgentId>([
   "ceo",
   "cto",
   "engineer",
@@ -47,14 +54,21 @@ const API_AGENTS = new Set<AgentId>([
   "devops",
 ]);
 
+function useFullPipeline(provider: string): boolean {
+  // 8B R1 on CPU is slow — default to lean team. Set OLLAMA_FULL_TEAM=true for all 9.
+  if (provider === "ollama") {
+    return process.env.OLLAMA_FULL_TEAM === "true";
+  }
+  return false;
+}
+
 function skipNote(agentId: AgentId): string {
   const notes: Partial<Record<AgentId, string>> = {
     research:
-      "Free-tier skip: Research folded into CEO vision. Proceeding to architecture.",
-    pm: "Free-tier skip: Product scope covered by CEO/CTO. Proceeding.",
-    qa: "Free-tier skip: QA checks covered lightly by Reviewer. Proceeding to DevOps.",
-    marketing:
-      "Free-tier skip: Marketing deferred to keep within free API limits.",
+      "Local skip: Research folded into CEO (faster on DeepSeek R1 8B).",
+    pm: "Local skip: Product scope covered by CEO/CTO.",
+    qa: "Local skip: QA covered lightly by Reviewer.",
+    marketing: "Local skip: Marketing deferred for speed on local 8B.",
   };
   return notes[agentId] || "Free-tier skip.";
 }
@@ -68,28 +82,30 @@ async function runAgent(
   opts?: { jsonMode?: boolean; maxTokens?: number }
 ): Promise<string> {
   const agent = getAgent(agentId);
-  const cfg = getProviderConfig();
-  const client = getOpenAI();
+  let cfg: ResolvedProvider = getProviderConfig();
 
   const wantJson = Boolean(opts?.jsonMode);
-  const useJsonMode = wantJson && cfg.supportsJsonMode;
-  const maxTokens =
-    opts?.maxTokens ??
-    (agentId === "engineer" ? cfg.engineerMaxTokens : cfg.defaultMaxTokens);
-
-  emit({ type: "agent_start", agentId, agentName: agent.name });
-
   let userExtra = extra || "";
-  if (wantJson && !useJsonMode) {
+  if (wantJson && !cfg.supportsJsonMode) {
     userExtra +=
       `\n\nIMPORTANT: Reply with ONLY valid JSON (no markdown fences). ` +
       `Shape: {"files":[{"path":"...","content":"..."}]}`;
   }
 
-  const maxAttempts = 4;
+  emit({ type: "agent_start", agentId, agentName: agent.name });
+
+  const maxAttempts = 6;
   let lastError = "";
+  let keysTried = 0;
 
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    cfg = getProviderConfig();
+    const client = getOpenAI(cfg);
+    const useJsonMode = wantJson && cfg.supportsJsonMode;
+    const maxTokens =
+      opts?.maxTokens ??
+      (agentId === "engineer" ? cfg.engineerMaxTokens : cfg.defaultMaxTokens);
+
     try {
       const stream = await client.chat.completions.create({
         model: cfg.model,
@@ -114,13 +130,28 @@ async function runAgent(
       });
 
       let content = "";
+      let reasoning = "";
       for await (const chunk of stream) {
-        const delta = chunk.choices[0]?.delta?.content || "";
+        // Ollama reasoning models (e.g. deepseek-r1) stream thought tokens via
+        // `delta.reasoning` before any real `delta.content`. Stream them so the
+        // agent card stays live (not stuck) while the model thinks.
+        const choice = chunk.choices[0]?.delta as { content?: string | null } & {
+          reasoning?: string;
+          reasoning_content?: string;
+        };
+        const thought = choice?.reasoning || choice?.reasoning_content || "";
+        if (thought) {
+          reasoning += thought;
+          emit({ type: "agent_delta", agentId, delta: thought });
+        }
+        const delta = choice?.content || "";
         if (delta) {
           content += delta;
           emit({ type: "agent_delta", agentId, delta });
         }
       }
+
+      if (!content && reasoning) content = reasoning;
 
       emit({ type: "agent_done", agentId, content });
 
@@ -136,24 +167,50 @@ async function runAgent(
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       lastError = message;
+
+      if (isQuotaOrAuthError(message) && cfg.keyCount > 1) {
+        const rotated = rotateProviderKey(cfg.provider);
+        if (rotated) {
+          keysTried += 1;
+          emit({
+            type: "status",
+            message: `Key limit/expired on ${cfg.provider} — switched API key (${keysTried}/${cfg.keyCount}) and retrying ${agent.name}…`,
+          });
+          await sleep(500);
+          continue;
+        }
+      }
+
       const is429 = /429|rate|limit|quota/i.test(message);
       if (is429 && attempt < maxAttempts) {
-        const waitSec = attempt * 20;
+        const waitSec = Math.min(attempt * 8, 30);
         emit({
           type: "status",
-          message: `Free quota busy — waiting ${waitSec}s then retrying ${agent.name} (${attempt}/${maxAttempts})…`,
+          message: `Quota busy — waiting ${waitSec}s then retrying ${agent.name} (${attempt}/${maxAttempts})…`,
         });
         await sleep(waitSec * 1000);
         continue;
       }
 
+      // Last resort: fall back to local Ollama if cloud keys all fail
+      if (
+        isQuotaOrAuthError(message) &&
+        cfg.provider !== "ollama" &&
+        process.env.OLLAMA_FALLBACK !== "false"
+      ) {
+        process.env.LLM_PROVIDER = "ollama";
+        emit({
+          type: "status",
+          message: `Cloud keys exhausted — falling back to local Ollama deepseek-r1:8b…`,
+        });
+        continue;
+      }
+
       let hint = "";
       if (/402|payment required/i.test(message)) {
-        hint =
-          ` ${cfg.provider} needs billing. Stay on free Gemini or OpenRouter :free models.`;
+        hint = ` Add another Groq key to GROQ_API_KEYS (comma-separated) for auto-rotate.`;
       } else if (is429) {
-        hint =
-          ` Free rate limit on ${cfg.provider} (${cfg.model}). Wait 1–2 minutes and try again, or create a fresh key at https://aistudio.google.com/apikey (keys usually start with AIza).`;
+        hint = ` Add more keys in GROQ_API_KEYS=key1,key2,key3 so the app can auto-switch.`;
       }
       throw new Error(`${message}${hint}`);
     }
@@ -195,12 +252,19 @@ const PIPELINE: AgentId[] = [
 
 export async function runPipeline(idea: string, emit: Emit): Promise<void> {
   const cfg = getProviderConfig();
-  const gapMs = cfg.provider === "gemini" || cfg.provider === "groq" ? 2500 : 400;
+  const gapMs =
+    cfg.provider === "gemini" || cfg.provider === "groq" ? 2500 : 200;
+  const fullTeam = useFullPipeline(cfg.provider);
 
   emit({ type: "run_start", idea });
   emit({
     type: "status",
-    message: `Using ${cfg.provider} · ${cfg.model} (free-friendly mode)`,
+    message:
+      cfg.provider === "groq"
+        ? `Fast Groq · ${cfg.model} · ${describeActiveKey(cfg)} — auto key-rotate on limits`
+        : cfg.provider === "ollama"
+          ? `Local Ollama · ${cfg.model} — no API key (CPU may be slow)`
+          : `Using ${cfg.provider} · ${cfg.model} · ${describeActiveKey(cfg)}`,
   });
 
   const messages: AgentMessage[] = [];
@@ -208,7 +272,7 @@ export async function runPipeline(idea: string, emit: Emit): Promise<void> {
 
   try {
     for (const agentId of PIPELINE) {
-      if (!API_AGENTS.has(agentId)) {
+      if (!fullTeam && !CLOUD_LITE_AGENTS.has(agentId)) {
         await skipAgent(agentId, messages, emit);
         continue;
       }
